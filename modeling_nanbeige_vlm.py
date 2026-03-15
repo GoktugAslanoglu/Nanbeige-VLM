@@ -82,7 +82,7 @@ class NanbeigeVLMModel(PreTrainedModel):
 
         # ── Vision tower (frozen at Stage 1) ──────────────────────────────
         self.vision_tower = SiglipVisionModel.from_pretrained(
-            config.vision_model_id, torch_dtype=torch.bfloat16
+            config.vision_model_id, torch_dtype=torch.bfloat16, device_map=None
         )
         self.vision_tower.requires_grad_(False)
         vision_hidden_size = self.vision_tower.config.hidden_size
@@ -94,12 +94,14 @@ class NanbeigeVLMModel(PreTrainedModel):
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2",
+                device_map=None
             )
         except (ImportError, ValueError):
             self.language_model = AutoModelForCausalLM.from_pretrained(
                 config.llm_model_id,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
+                device_map=None
             )
         self.language_model.requires_grad_(False)
         llm_hidden_size = self.language_model.config.hidden_size
