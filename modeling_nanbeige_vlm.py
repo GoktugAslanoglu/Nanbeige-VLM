@@ -7,12 +7,14 @@ Usage:
 
     model     = AutoModel.from_pretrained("SkyAsl/Nanbeige4.1-VLM-Base", trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained("SkyAsl/Nanbeige4.1-VLM-Base", trust_remote_code=True)
+    model.set_tokenizer(tokenizer)
 
     image  = Image.open("photo.jpg")
     result = model.describe(image)
     print(result)
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +24,10 @@ from transformers import (
     SiglipVisionModel,
     SiglipImageProcessor,
 )
+from transformers.utils import logging
 from .configuration_nanbeige_vlm import NanbeigeVLMConfig
+
+logger = logging.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -30,18 +35,6 @@ from .configuration_nanbeige_vlm import NanbeigeVLMConfig
 # ---------------------------------------------------------------------------
 
 class PooledProjector(nn.Module):
-    """
-    Reduces SigLIP's 729 patch tokens to 196 via spatial average pooling,
-    then projects to the LLM hidden dimension.
-
-        (B, 729, D_vision)
-          → reshape  (B, D_vision, 27, 27)
-          → pad      (B, D_vision, 28, 28)
-          → avgpool  (B, D_vision, 14, 14)
-          → flatten  (B, 196, D_vision)
-          → linear   (B, 196, D_llm)
-    """
-
     def __init__(self, vision_hidden_size: int, llm_hidden_size: int):
         super().__init__()
         self.proj = nn.Sequential(
@@ -53,10 +46,10 @@ class PooledProjector(nn.Module):
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         B, N, C = image_features.shape
         x = image_features.permute(0, 2, 1).reshape(B, C, 27, 27)
-        x = F.pad(x, (0, 1, 0, 1), mode="replicate")   # 27×27 → 28×28
-        x = F.avg_pool2d(x, kernel_size=2, stride=2)    # 28×28 → 14×14
-        x = x.flatten(2).permute(0, 2, 1)               # (B, 196, C)
-        return self.proj(x)                              # (B, 196, D_llm)
+        x = F.pad(x, (0, 1, 0, 1), mode="replicate")
+        x = F.avg_pool2d(x, kernel_size=2, stride=2)
+        x = x.flatten(2).permute(0, 2, 1)
+        return self.proj(x)
 
 
 # ---------------------------------------------------------------------------
@@ -64,59 +57,102 @@ class PooledProjector(nn.Module):
 # ---------------------------------------------------------------------------
 
 class NanbeigeVLMModel(PreTrainedModel):
-    """
-    SigLIP so400m  →  PooledProjector (729→196 tokens)  →  Nanbeige4.1-3B
-
-    Stage 1 pretrain: only mm_projector is trained.
-    Vision tower and LLM are frozen.
-    """
-
     config_class = NanbeigeVLMConfig
-
-    # Tells transformers which keys belong to sub-models that are loaded
-    # separately — prevents 'unexpected key' warnings.
     _no_split_modules = ["SiglipVisionModel", "NanbeigeForCausalLM"]
 
     def __init__(self, config: NanbeigeVLMConfig, image_token_id: int = None):
         super().__init__(config)
-
-        # ── Vision tower (frozen at Stage 1) ──────────────────────────────
-        self.vision_tower = SiglipVisionModel.from_pretrained(
-            config.vision_model_id, torch_dtype=torch.bfloat16, device_map=None
-        )
-        self.vision_tower.requires_grad_(False)
-        vision_hidden_size = self.vision_tower.config.hidden_size
-
-        # ── Language model (frozen at Stage 1) ────────────────────────────
-        try:
-            self.language_model = AutoModelForCausalLM.from_pretrained(
-                config.llm_model_id,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-                device_map=None
-            )
-        except (ImportError, ValueError):
-            self.language_model = AutoModelForCausalLM.from_pretrained(
-                config.llm_model_id,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                device_map=None
-            )
-        self.language_model.requires_grad_(False)
-        llm_hidden_size = self.language_model.config.hidden_size
-
-        # ── Projector ──────────────────────────────────────────────────────
-        self.mm_projector = PooledProjector(
-            vision_hidden_size, llm_hidden_size
-        ).to(torch.bfloat16)
-
-        # Set after resize_token_embeddings if needed
+        # Sub-models are NOT loaded here — from_pretrained() handles this.
+        # This prevents the meta-device conflict with nested from_pretrained calls.
+        self.vision_tower   = None
+        self.language_model = None
+        self.mm_projector   = None
         self.image_token_id = image_token_id
-        self.post_init()
 
     # ------------------------------------------------------------------
-    # Core forward (used by Trainer)
+    # Override from_pretrained to handle nested model loading correctly
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """
+        Custom loader that:
+          1. Loads sub-models (SigLIP, LLM) normally — outside any meta context.
+          2. Loads only projector weights from the checkpoint.
+          3. Returns a fully initialised NanbeigeVLMModel.
+        """
+        import safetensors.torch
+        from huggingface_hub import hf_hub_download
+
+        config    = kwargs.pop("config", None)
+        token     = kwargs.pop("token", None)
+        cache_dir = kwargs.pop("cache_dir", None)
+
+        if config is None:
+            config = NanbeigeVLMConfig.from_pretrained(
+                pretrained_model_name_or_path, token=token, cache_dir=cache_dir
+            )
+
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+
+        # ── 1. Build empty shell ──────────────────────────────────────
+        model = cls(config)
+
+        # ── 2. Load SigLIP ────────────────────────────────────────────
+        logger.info("Loading vision tower...")
+        model.vision_tower = SiglipVisionModel.from_pretrained(
+            config.vision_model_id,
+            torch_dtype=torch_dtype,
+            device_map=None,
+        )
+        model.vision_tower.requires_grad_(False)
+        vision_hidden_size = model.vision_tower.config.hidden_size
+
+        # ── 3. Load LLM ───────────────────────────────────────────────
+        logger.info("Loading language model...")
+        try:
+            model.language_model = AutoModelForCausalLM.from_pretrained(
+                config.llm_model_id,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                attn_implementation="flash_attention_2",
+                device_map=None,
+            )
+        except (ImportError, ValueError):
+            model.language_model = AutoModelForCausalLM.from_pretrained(
+                config.llm_model_id,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                device_map=None,
+            )
+        model.language_model.requires_grad_(False)
+        llm_hidden_size = model.language_model.config.hidden_size
+
+        # ── 4. Build projector, load trained weights ──────────────────
+        model.mm_projector = PooledProjector(
+            vision_hidden_size, llm_hidden_size
+        ).to(torch_dtype)
+
+        logger.info("Loading projector weights from checkpoint...")
+        weights_path = hf_hub_download(
+            repo_id=pretrained_model_name_or_path,
+            filename="model.safetensors",
+            token=token,
+            cache_dir=cache_dir,
+        )
+        all_weights  = safetensors.torch.load_file(weights_path)
+        proj_weights = {k: v for k, v in all_weights.items() if "mm_projector" in k}
+
+        # Strip "mm_projector." prefix for load_state_dict
+        proj_weights_clean = {k.replace("mm_projector.", "", 1): v
+                              for k, v in proj_weights.items()}
+        model.mm_projector.load_state_dict(proj_weights_clean)
+
+        logger.info("NanbeigeVLM loaded successfully.")
+        return model
+
+    # ------------------------------------------------------------------
+    # forward (used by Trainer during Stage 2)
     # ------------------------------------------------------------------
 
     def forward(self, input_ids, pixel_values, attention_mask=None, labels=None):
@@ -126,9 +162,9 @@ class NanbeigeVLMModel(PreTrainedModel):
         with torch.inference_mode():
             image_features = self.vision_tower(
                 pixel_values=pixel_values
-            ).last_hidden_state                             # (B, 729, D_vision)
+            ).last_hidden_state
 
-        image_embeds     = self.mm_projector(image_features)  # (B, 196, D_llm)
+        image_embeds     = self.mm_projector(image_features)
         num_image_tokens = image_embeds.shape[1]
 
         with torch.inference_mode():
@@ -151,17 +187,27 @@ class NanbeigeVLMModel(PreTrainedModel):
 
             pos = positions[0].item()
             merged_embeds.append(
-                torch.cat([inputs_embeds[i, :pos], image_embeds[i], inputs_embeds[i, pos+1:]], dim=0)
+                torch.cat([inputs_embeds[i, :pos], image_embeds[i],
+                           inputs_embeds[i, pos+1:]], dim=0)
             )
             if attention_mask is not None:
-                img_mask = torch.ones(num_image_tokens, device=attention_mask.device, dtype=attention_mask.dtype)
+                img_mask = torch.ones(
+                    num_image_tokens,
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                )
                 merged_mask.append(
-                    torch.cat([attention_mask[i, :pos], img_mask, attention_mask[i, pos+1:]])
+                    torch.cat([attention_mask[i, :pos], img_mask,
+                               attention_mask[i, pos+1:]])
                 )
             if labels is not None:
-                img_labels = torch.full((num_image_tokens,), -100, device=labels.device, dtype=labels.dtype)
+                img_labels = torch.full(
+                    (num_image_tokens,), -100,
+                    device=labels.device, dtype=labels.dtype,
+                )
                 merged_labels.append(
-                    torch.cat([labels[i, :pos], img_labels, labels[i, pos+1:]])
+                    torch.cat([labels[i, :pos], img_labels,
+                               labels[i, pos+1:]])
                 )
 
         combined_embeds = torch.stack(merged_embeds, dim=0)
@@ -175,7 +221,7 @@ class NanbeigeVLMModel(PreTrainedModel):
         )
 
     # ------------------------------------------------------------------
-    # High-level inference helpers
+    # Inference helpers
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -189,29 +235,11 @@ class NanbeigeVLMModel(PreTrainedModel):
         temperature: float = 0.7,
         repetition_penalty: float = 1.3,
     ) -> str:
-        """
-        Convenience method: pass a PIL image, get a text description back.
-
-        Args:
-            image:              PIL.Image
-            prompt:             Instruction string
-            tokenizer:          Pass tokenizer if not set on model
-            max_new_tokens:     Max output length
-            do_sample:          True for creative outputs, False for deterministic
-            temperature:        Sampling temperature (only used if do_sample=True)
-            repetition_penalty: Penalise repeated tokens
-
-        Returns:
-            str: generated description
-        """
-        assert self.image_token_id is not None, \
-            "Set model.image_token_id before calling describe()."
-
         tok = tokenizer or getattr(self, "_tokenizer", None)
         assert tok is not None, \
             "Pass tokenizer=... to describe() or call model.set_tokenizer(tokenizer) first."
 
-        device    = next(self.parameters()).device
+        device    = next(self.mm_projector.parameters()).device
         processor = SiglipImageProcessor.from_pretrained(self.config.vision_model_id)
 
         pixel_values   = processor(images=image, return_tensors="pt").pixel_values.to(device, dtype=torch.bfloat16)
@@ -242,5 +270,5 @@ class NanbeigeVLMModel(PreTrainedModel):
 
     def set_tokenizer(self, tokenizer):
         """Attach tokenizer to model so you don't have to pass it to describe()."""
-        self._tokenizer = tokenizer
+        self._tokenizer  = tokenizer
         self.image_token_id = tokenizer.convert_tokens_to_ids("<image>")
