@@ -1,19 +1,3 @@
-"""
-NanbeigeVLM — SigLIP vision encoder + MLP projector + Nanbeige4.1-3B LLM.
-
-Usage:
-    from transformers import AutoModel, AutoTokenizer
-    from PIL import Image
-
-    model     = AutoModel.from_pretrained("SkyAsl/Nanbeige4.1-VLM-Base", trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained("SkyAsl/Nanbeige4.1-VLM-Base", trust_remote_code=True)
-    model.set_tokenizer(tokenizer)
-
-    image  = Image.open("photo.jpg")
-    result = model.describe(image)
-    print(result)
-"""
-
 import os
 import torch
 import torch.nn as nn
@@ -29,10 +13,6 @@ from .configuration_nanbeige_vlm import NanbeigeVLMConfig
 
 logger = logging.get_logger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Pooled projector  (729 → 196 tokens via 2×2 avg-pool then linear)
-# ---------------------------------------------------------------------------
 
 class PooledProjector(nn.Module):
     def __init__(self, vision_hidden_size: int, llm_hidden_size: int):
@@ -52,26 +32,16 @@ class PooledProjector(nn.Module):
         return self.proj(x)
 
 
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
-
 class NanbeigeVLMModel(PreTrainedModel):
     config_class = NanbeigeVLMConfig
     _no_split_modules = ["SiglipVisionModel", "NanbeigeForCausalLM"]
 
     def __init__(self, config: NanbeigeVLMConfig, image_token_id: int = None):
         super().__init__(config)
-        # Sub-models are NOT loaded here — from_pretrained() handles this.
-        # This prevents the meta-device conflict with nested from_pretrained calls.
         self.vision_tower   = None
         self.language_model = None
         self.mm_projector   = None
         self.image_token_id = image_token_id
-
-    # ------------------------------------------------------------------
-    # Override from_pretrained to handle nested model loading correctly
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -95,10 +65,8 @@ class NanbeigeVLMModel(PreTrainedModel):
 
         torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
 
-        # ── 1. Build empty shell ──────────────────────────────────────
         model = cls(config)
 
-        # ── 2. Load SigLIP ────────────────────────────────────────────
         logger.info("Loading vision tower...")
         model.vision_tower = SiglipVisionModel.from_pretrained(
             config.vision_model_id,
@@ -108,7 +76,6 @@ class NanbeigeVLMModel(PreTrainedModel):
         model.vision_tower.requires_grad_(False)
         vision_hidden_size = model.vision_tower.config.hidden_size
 
-        # ── 3. Load LLM ───────────────────────────────────────────────
         logger.info("Loading language model...")
         try:
             model.language_model = AutoModelForCausalLM.from_pretrained(
@@ -128,7 +95,6 @@ class NanbeigeVLMModel(PreTrainedModel):
         model.language_model.requires_grad_(False)
         llm_hidden_size = model.language_model.config.hidden_size
 
-        # ── 4. Build projector, load trained weights ──────────────────
         model.mm_projector = PooledProjector(
             vision_hidden_size, llm_hidden_size
         ).to(torch_dtype)
@@ -143,7 +109,6 @@ class NanbeigeVLMModel(PreTrainedModel):
         all_weights  = safetensors.torch.load_file(weights_path)
         proj_weights = {k: v for k, v in all_weights.items() if "mm_projector" in k}
 
-        # Strip "mm_projector." prefix for load_state_dict
         proj_weights_clean = {k.replace("mm_projector.", "", 1): v
                               for k, v in proj_weights.items()}
         model.mm_projector.load_state_dict(proj_weights_clean)
@@ -151,9 +116,6 @@ class NanbeigeVLMModel(PreTrainedModel):
         logger.info("NanbeigeVLM loaded successfully.")
         return model
 
-    # ------------------------------------------------------------------
-    # forward (used by Trainer during Stage 2)
-    # ------------------------------------------------------------------
 
     def forward(self, input_ids, pixel_values, attention_mask=None, labels=None):
         assert self.image_token_id is not None, \
@@ -220,9 +182,6 @@ class NanbeigeVLMModel(PreTrainedModel):
             labels=combined_labels,
         )
 
-    # ------------------------------------------------------------------
-    # Inference helpers
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def describe(
