@@ -2,13 +2,6 @@ from transformers import PretrainedConfig
 
 
 class NanbeigeVLMConfig(PretrainedConfig):
-    """
-    Configuration for NanbeigeVLM.
-
-    Args:
-        vision_model_id: HuggingFace model ID for the vision tower.
-        llm_model_id:    HuggingFace model ID for the language model.
-    """
 
     model_type = "nanbeige_vlm"
 
